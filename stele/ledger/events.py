@@ -4,7 +4,8 @@ The hash-chained event log (roadmap #15: "Append-only, hash-chained event log").
 Every fact the ledger learns is appended here as an event, in the same
 database transaction as the change it describes, so the two cannot diverge:
 
-  record.created / record.sealed / record.failed / record.invalidated
+  record.created / record.sealed / record.failed / record.invalidated /
+  record.reverified
   delivery.opened / delivery.event        (the #13 delivery log)
   replay.logged                           (the #14 replay log)
   *.imported                              (state found when a ledger was migrated)
@@ -217,6 +218,7 @@ _RECORD_STATE = {
     "record.sealed": "sealed",
     "record.failed": "failed",
     "record.invalidated": "invalidated",
+    "record.reverified": "sealed",     # an operator restored missing evidence (ledger.reverify)
 }
 
 

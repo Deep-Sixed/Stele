@@ -31,7 +31,7 @@ This is the one definition of ledger states. Other docs and code link here.
 | `pending` | The bundle is hashed and recorded; it is not yet archived. | `seal`, `fail`, `invalidate` |
 | `sealed` | Every artifact and the bundle's tree object are stored in the evidence archive and were verified against the recorded manifest. | `invalidate` |
 | `failed` | The parser failed, a check before sealing failed, or sealing failed. Never becomes sealed. | terminal |
-| `invalidated` | Withdrawn after the fact (see [replay.md](replay.md)). The record is kept. | terminal |
+| `invalidated` | Withdrawn after the fact (see [replay.md](replay.md)). The record is kept. | terminal, except a record the migration invalidated for missing evidence, which `reverify` can seal again (below) |
 
 - **Sealed is integrity, not delivery.** A sealed record says nothing about
   whether any downstream target has received it. Delivery is a separate set
@@ -151,11 +151,29 @@ Migrating a pre-#12 (version 0) ledger:
 |------------|---------|
 | `pending`, `failed`, `invalidated` | Same state |
 | `committed`, bundle archivable and matching its manifest (from disk, or already in the archive) | `sealed` |
-| `committed`, bundle missing, changed or unsafe | `invalidated`, with the reason in `error` — the ledger can no longer vouch for it |
+| `committed`, bundle missing, changed or unsafe | `invalidated`, with the reason in `error` — the ledger can no longer vouch for it. The error says `evidence missing` (neither on disk nor archived) or `evidence mismatched` (anything else) |
 | `source_hash` that is the digest of exactly one Snapshot in the archive | Kept, with its `source_kind` |
 | any other `source_hash` | Moved to `legacy_source_hash` |
 | `source_path` | Kept, and recorded as a Source in the archive |
 | parser identity and config | Unknown: `NULL` |
+
+**Restoring missing evidence.** Invalidating is permanent, but evidence the
+archive never held (a pre-#16 ledger) may still exist on disk. After migration,
+an operator who has the files can seal such a record again:
+
+```bash
+python -m stele.ledger.reverify ledger.db archive/ <record_id> --artifact-dir /where/the/files/are
+```
+
+This is never done by migration, and it is narrow. The record must have been
+invalidated *by the migration* for *missing* evidence: its error says so and
+its only event is the migration's import, so a record an operator or a replay
+invalidated stays invalidated, as does one whose evidence was `mismatched`. It
+must have no deliveries (invalidating withdrew the delivered data). The files
+are hashed against the recorded manifest and archived exactly as sealing does;
+any difference leaves the record invalidated. On success the record is sealed,
+its error cleared, and a `record.reverified` event is chained, so the history
+reads: imported as invalidated, reverified.
 
 Two records for one `run_id` cannot be represented; migration stops with
 `LedgerMigrationError` and changes nothing. A ledger newer than this Stele
@@ -171,6 +189,7 @@ the two can't diverge:
 |---|---|
 | `record.created` | `create_pending`: run, artifact hash, input Snapshot, Source, parser identity and config, backend |
 | `record.sealed` / `record.failed` / `record.invalidated` | each state transition, with its error or reason |
+| `record.reverified` | an operator restored a record the migration invalidated for missing evidence (below) |
 | `delivery.opened` / `delivery.event` | each delivery and each intent, receipt, failure or removal in the delivery log |
 | `replay.logged` | each replay and its outcome |
 | `*.imported` | the state found when a ledger was migrated to version 5 |
@@ -217,6 +236,7 @@ if there is any problem.
 - `stele/ledger/delivery.py` — the delivery log (#13)
 - `tests/test_ledger.py` — state machine, hashing, per-run records
 - `tests/test_ledger_provenance.py` — Snapshot provenance, parser identity, sealing, migration
+- `tests/test_reverify.py` — restoring records invalidated for missing evidence
 - `tests/test_event_log.py` — chaining, verification, tamper detection, anchors, migration, CLI
 
 ## Completion criteria
