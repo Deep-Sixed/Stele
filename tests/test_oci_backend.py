@@ -38,6 +38,7 @@ from stele.containment.oci import (
     parse_engine_info,
 )
 from stele.containment.capture import BoundedRun
+from stele.containment.telemetry import FailureReason
 from stele.containment.runner import run_in_sandbox
 from stele.containment.sandbox import SandboxConfig
 
@@ -222,6 +223,16 @@ class TestArgv:
         assert _pairs(argv, "--workdir") == ["/stele/output"]
         tmpfs = [t.split(":")[0] for t in _pairs(argv, "--tmpfs")]
         assert tmpfs == ["/tmp", "/home", "/mnt", "/root", "/run", "/var"]
+        assert all(t.split(":")[1].startswith("rw,") for t in _pairs(argv, "--tmpfs"))
+
+    def test_no_writable_scratch_makes_every_tmpfs_read_only(self, tmp_path: Path, monkeypatch) -> None:
+        # Issue #38: /stele/output must then be the only writable path.
+        _fake_engine(monkeypatch)
+        argv = _argv(OciBackend(), _config(tmp_path, writable_scratch=False))
+        tmpfs = _pairs(argv, "--tmpfs")
+        assert [t.split(":")[0] for t in tmpfs] == ["/tmp", "/home", "/mnt", "/root", "/run", "/var"]
+        assert all(t.split(":")[1].startswith("ro,") for t in tmpfs)
+        assert "--read-only" in argv
 
     def test_runs_exact_command_on_inspected_image_id(self, tmp_path: Path, monkeypatch) -> None:
         _fake_engine(monkeypatch)
@@ -437,6 +448,49 @@ class TestGpu:
 # ---------------------------------------------------------------------------
 # Execution, timeout, registry
 # ---------------------------------------------------------------------------
+
+class TestExitClassification:
+    """Issue #38: 125-127 are the engine's only when the engine says so."""
+
+    RUNC_NOT_FOUND = (
+        'Error: runc: runc create failed: unable to start container process: error during '
+        'container init: exec: "nosuch": executable file not found in $PATH: OCI runtime '
+        "attempted to invoke a command that was not found"
+    )
+    DOCKER_NOT_FOUND = (
+        "docker: Error response from daemon: failed to create task for container: failed to "
+        "create shim task: OCI runtime create failed: runc create failed: unable to start "
+        'container process: exec: "/no/such": stat /no/such: no such file or directory: unknown.'
+    )
+
+    @pytest.mark.parametrize("code, stderr", [
+        (127, RUNC_NOT_FOUND),
+        (127, DOCKER_NOT_FOUND),
+        (127, DOCKER_NOT_FOUND + "\n\nRun 'docker run --help' for more information"),
+        (125, "docker: Error response from daemon: pull access denied.\n\n"
+              "Run 'docker run --help' for more information"),
+        (126, 'Error: runc: ... exec: "/etc/passwd": permission denied: OCI permission denied'),
+        (125, "Error: nosuchimage:1: image not known"),
+        (125, 'Error: default OCI runtime "nosuch" not found: invalid argument'),
+        (125, "docker: Error response from daemon: Unknown runtime specified nosuch."),
+    ])
+    def test_engine_failures(self, code: int, stderr: str) -> None:
+        failure = OciBackend()._classify(code, "parser noise\n" + stderr + "\n", 0.1, 60, False)
+        assert failure.reason is FailureReason.ENGINE_ERROR, failure
+        assert failure.exit_code == code
+
+    @pytest.mark.parametrize("code, stderr", [
+        (126, "Error: parser says no"),
+        (127, "Traceback ...\nSystemExit: 127"),
+        (125, "the parser gave up"),
+        (126, "Error: noise\n" + "x\n" * 5),        # an engine-looking line, long before the end
+        (126, ""),
+    ])
+    def test_the_parsers_own_exit_status(self, code: int, stderr: str) -> None:
+        failure = OciBackend()._classify(code, stderr, 0.1, 60, False)
+        assert failure.reason is FailureReason.EXIT_STATUS, failure
+        assert failure.exit_code == code
+
 
 class TestExecution:
 

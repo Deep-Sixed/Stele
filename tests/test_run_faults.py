@@ -224,6 +224,47 @@ def test_container_engine_error(tmp_path: Path, backend: OciBackend) -> None:
     _assert_clean(result, backend)
 
 
+@pytest.mark.parametrize("backend", _LIMITED, ids=[_proof_id(b) for b in _LIMITED])
+@pytest.mark.parametrize("code", [125, 126, 127])
+def test_parser_exit_125_to_127_is_its_own(tmp_path: Path, backend: OciBackend, code: int) -> None:
+    """Issue #38: a parser exiting 125-127 is not an engine error."""
+    if not backend.available():
+        pytest.skip(f"{backend.name} backend unavailable here: {backend.unavailable_reason()}")
+    # Neutral wording: a parser that copies the engine's own "Error: ..." line at
+    # exit 125 cannot be told apart from the engine (see oci._engine_failed).
+    result = _run(tmp_path, "python3", f"import sys; print('parser gave up', file=sys.stderr); "
+                                       f"sys.exit({code})", backend=backend)
+    assert result.failure.reason is FailureReason.EXIT_STATUS, result.failure
+    assert result.failure.exit_code == code
+    _assert_clean(result, backend)
+
+
+@pytest.mark.parametrize("backend", _LIMITED, ids=[_proof_id(b) for b in _LIMITED])
+def test_no_writable_scratch_in_a_container(tmp_path: Path, backend: OciBackend) -> None:
+    """Issue #38: with writable_scratch=False only /stele/output is writable."""
+    if not backend.available():
+        pytest.skip(f"{backend.name} backend unavailable here: {backend.unavailable_reason()}")
+    code = (
+        "import os, sys\n"
+        "blocked = []\n"
+        "for d in ('/tmp', '/var', '/run', '/home', '/root', '/mnt', '/etc', '/'):\n"
+        "    try:\n"
+        "        open(os.path.join(d, 'stele-probe'), 'w').close()\n"
+        "        print('WROTE', d, file=sys.stderr)\n"
+        "    except OSError:\n"
+        "        blocked.append(d)\n"
+        "open('/stele/output/ok.txt', 'w').write(' '.join(blocked))\n"
+    )
+    config = SandboxConfig(command=["python3", "-c", code], artifact_dir=tmp_path / "out",
+                           writable_scratch=False)
+    result = run_in_sandbox(config, backend=backend)
+    assert result.exit_code == 0, result.stderr
+    assert "WROTE" not in result.stderr, result.stderr
+    assert (tmp_path / "out" / "ok.txt").read_text().split() == [
+        "/tmp", "/var", "/run", "/home", "/root", "/mnt", "/etc", "/",
+    ]
+
+
 def test_blocked_syscall_is_reported(tmp_path: Path) -> None:
     from stele.containment import seccomp
     from stele.containment.backend import BubblewrapBackend
