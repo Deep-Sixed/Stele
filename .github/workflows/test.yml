@@ -16,6 +16,10 @@ jobs:
   # /usr/bin/python3 and resolves back to it. Containers use their own image.
   linux-containment:
     runs-on: ubuntu-24.04
+    # The suite takes about 4 minutes. A container engine that stops answering
+    # has hung this job for over an hour; the per-test timeout below names the
+    # stuck test, and this bounds whatever it cannot catch (install, pull).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install containment dependencies
@@ -57,7 +61,10 @@ jobs:
         # step even though its output is piped through tee.
         shell: bash
         run: |
-          .venv/bin/python -m pytest tests -q -rs | tee pytest.log
+          # --timeout fails a test that runs longer than 10 minutes (the longest
+          # takes seconds), with its name and a stack dump, and goes on with the
+          # rest. Not -v: the skip check below reads SKIPPED lines.
+          .venv/bin/python -m pytest tests -q -rs --timeout=600 | tee pytest.log
           # Windows-only tests may skip here, and the GPU variant of the OCI
           # backend skips because hosted runners have no GPU; nothing else may.
           if grep "SKIPPED" pytest.log | grep -v "Windows feature" | grep -qv "no usable GPU"; then
@@ -76,6 +83,7 @@ jobs:
         os: [macos-latest, windows-latest]
         python: ["3.12", "3.13"]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -84,4 +92,4 @@ jobs:
       - name: Install Stele with declared dev dependencies
         run: python -m pip install -e ".[dev]"
       - name: Run Stele suite
-        run: python -m pytest tests -q -rs
+        run: python -m pytest tests -q -rs --timeout=600
