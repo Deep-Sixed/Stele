@@ -225,8 +225,12 @@ def verify_ledger(ledger: LedgerStore, *, anchor: tuple[int, str] | None = None)
 
     Replays the chain to derive every record's state and identity, every
     delivery and its events, and every replay, and reports each row that is
-    missing from the chain, missing from the tables, or different.
+    missing from the chain, missing from the tables, or different. Every
+    field an event commits to is compared; a record's source_path is checked
+    against the archived Source its source_id names. artifact_dir is only
+    where the run's output was on disk, not evidence, and is not checked.
     """
+    from ..archive.store import ArchiveError
     from .hashing import sha256_manifest
 
     log = EventLog(ledger)
@@ -273,8 +277,10 @@ def verify_ledger(ledger: LedgerStore, *, anchor: tuple[int, str] | None = None)
                 continue
             actual = {
                 "run_id": row["run_id"], "artifact_hash": row["artifact_hash"],
-                "source_hash": row["source_hash"], "parser": parser,
+                "source_hash": row["source_hash"], "source_kind": row["source_kind"],
+                "source_id": row["source_id"], "backend": row["backend"], "parser": parser,
                 "parser_config": config, "run_conditions": conditions, "state": row["state"],
+                "error": row["error"], "created_at": row["created_at"],
             }
             for key in sorted(want):
                 if actual[key] != want[key]:
@@ -283,6 +289,19 @@ def verify_ledger(ledger: LedgerStore, *, anchor: tuple[int, str] | None = None)
                     )
             if manifest_hash != row["artifact_hash"]:
                 problems.append(f"record {record_id}: artifact_manifest no longer matches artifact_hash")
+            # source_path is the locator of the Source that source_id hashes;
+            # the chain commits to source_id, so the archive vouches for it.
+            if row["source_id"] is not None:
+                try:
+                    locator = ledger.archive.get_source(row["source_id"]).locator
+                except ArchiveError as exc:
+                    problems.append(f"record {record_id}: its Source is unreadable: {exc}")
+                else:
+                    if row["source_path"] != locator:
+                        problems.append(
+                            f"record {record_id}: source_path is {row['source_path']!r}, "
+                            f"its Source says {locator!r}"
+                        )
 
         rows = {r["dispatch_id"]: r for r in conn.execute("SELECT * FROM deliveries")}
         for dispatch_id in sorted(set(rows) | set(deliveries)):
@@ -306,8 +325,17 @@ def verify_ledger(ledger: LedgerStore, *, anchor: tuple[int, str] | None = None)
             if row is None or want is None:
                 where = "the chain" if row is None else "the ledger"
                 problems.append(f"replay {replay_id} is only in {where}")
-            elif {k: row[k] for k in want} != want:
-                problems.append(f"replay {replay_id} differs from the chain")
+                continue
+            try:
+                actual = _replay_row(row)
+            except (ValueError, TypeError) as exc:
+                problems.append(f"replay {replay_id} has a malformed column: {exc!r}")
+                continue
+            for key in sorted(want):
+                if actual[key] != want[key]:
+                    problems.append(
+                        f"replay {replay_id}: {key} is {actual[key]!r}, the chain says {want[key]!r}"
+                    )
         return LedgerReport(chain=chain, problems=tuple(problems))
     finally:
         log.close()
@@ -323,22 +351,50 @@ def _apply(
     """Fold one event into the state the ledger's tables must hold."""
     b = ev.body
     if ev.kind in ("record.created", "record.imported"):
-        records[ev.subject] = {
+        want = {
             "run_id": b["run_id"], "artifact_hash": b["artifact_hash"],
             "source_hash": b.get("source_hash"),
+            "source_kind": b.get("source_kind"), "source_id": b.get("source_id"),
+            "backend": b.get("backend"),
             "parser": b.get("parser"), "parser_config": b.get("parser_config"),
             "run_conditions": b.get("run_conditions"),
             "state": b.get("state", "pending"),
+            "error": b.get("error"),
         }
+        # Chained since the event log first committed to it; older events
+        # leave the record's creation time unchecked.
+        if "created_at" in b:
+            want["created_at"] = b["created_at"]
+        records[ev.subject] = want
     elif ev.kind in _RECORD_STATE:
         if ev.subject in records:
-            records[ev.subject]["state"] = _RECORD_STATE[ev.kind]
+            want = records[ev.subject]
+            want["state"] = _RECORD_STATE[ev.kind]
+            if ev.kind == "record.failed":
+                want["error"] = b["error"]
+            elif ev.kind == "record.invalidated":
+                want["error"] = f"INVALIDATED: {b['reason']}"
     elif ev.kind in ("delivery.opened", "delivery.imported"):
         deliveries[ev.subject] = {k: b[k] for k in ("record_id", "target_kind", "target")}
     elif ev.kind in ("delivery.event", "delivery_event.imported"):
         delivery_events.setdefault(ev.subject, []).append(_event_tuple(b))
     elif ev.kind in ("replay.logged", "replay.imported"):
-        replays[ev.subject] = {k: b.get(k) for k in ("record_id", "outcome", "replay_artifact_hash")}
+        # Every field the event carries (replay.imported carries fewer).
+        replays[ev.subject] = {
+            k: b[k] for k in _REPLAY_FIELDS if k in b
+        }
+
+
+_REPLAY_FIELDS = (
+    "record_id", "outcome", "reason", "replay_artifact_hash", "policy", "platform",
+)
+
+
+def _replay_row(row: sqlite3.Row) -> dict[str, Any]:
+    """A replays row in the form the chain commits to (policy as an object)."""
+    out = {k: row[k] for k in _REPLAY_FIELDS}
+    out["policy"] = None if row["policy"] is None else json.loads(row["policy"])
+    return out
 
 
 def _event_tuple(e: Any) -> tuple:
@@ -373,6 +429,8 @@ def record_body(row: sqlite3.Row | dict[str, Any], *, with_state: bool = False) 
         "run_conditions": (
             None if row["run_conditions"] is None else json.loads(row["run_conditions"])
         ),
+        # Observations (stele.identity) name the run by when it was recorded.
+        "created_at": row["created_at"],
     }
     if with_state:
         body["state"] = row["state"]
@@ -401,9 +459,7 @@ def backfill(conn: sqlite3.Connection) -> int:
         })
         count += 1
     for row in conn.execute("SELECT * FROM replays ORDER BY replayed_at, replay_id").fetchall():
-        append_event(conn, "replay.imported", row["replay_id"], {
-            k: row[k] for k in ("record_id", "outcome", "reason", "replay_artifact_hash")
-        })
+        append_event(conn, "replay.imported", row["replay_id"], _replay_row(row))
         count += 1
     return count
 
@@ -417,7 +473,7 @@ def _main(argv: list[str] | None = None) -> int:
     from pathlib import Path
 
     from ..archive import BlobStore
-    from .store import LedgerStore
+    from .store import LedgerSchemaError, LedgerStore
 
     ap = argparse.ArgumentParser(
         prog="python -m stele.ledger.events",
@@ -432,7 +488,13 @@ def _main(argv: list[str] | None = None) -> int:
     if args.anchor:
         seq, _, digest = args.anchor.partition(":")
         anchor = (int(seq), digest)
-    ledger = LedgerStore(args.ledger, BlobStore(args.archive))
+    try:
+        # Read-only: migrating a ledger older than the event log would chain
+        # its current tables and then report them as verified.
+        ledger = LedgerStore(args.ledger, BlobStore(args.archive), migrate=False)
+    except LedgerSchemaError as exc:
+        print(json.dumps({"ok": False, "length": 0, "head": None, "problems": [str(exc)]}, indent=2))
+        return 1
     report = verify_ledger(ledger, anchor=anchor)
     print(json.dumps({
         "ok": report.ok,

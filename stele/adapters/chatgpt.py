@@ -5,10 +5,11 @@ Input is the sealed bundle of the ChatGPT export splitter (the Wasm extractor
 chatgpt-export-split, stele/extractors): index.jsonl plus one
 conversation-NNNNNN.json per conversation, each the exact bytes of one element
 of the export's conversations.json. The adapter reads them through the
-SealedBundle, so every byte it sees is re-verified against the sealed digest,
-and it never holds more than one conversation in memory: iter_chunks() is a
-generator that parses a conversation only when the previous one's chunks are
-consumed.
+SealedBundle, so every byte it sees is re-verified against the sealed digest.
+iter_chunks() is a generator that parses a conversation only when the
+previous one's chunks are consumed, so it holds one parsed conversation at a
+time. transform(), which the Dispatcher calls, returns the full chunk list
+(the adapter contract), so it holds the text of every conversation at once.
 
 A ChatGPT conversation is a tree, not a list. Its `mapping` holds every node
 the user ever produced: when a message is edited or a response regenerated,
@@ -24,8 +25,13 @@ every other branch. This adapter keeps them all:
 - per-conversation counts of nodes, leaves (= branches) and chunks, and the
   byte range of the conversation in the original export.
 
-Chunk ids are "<conversation_id>:<node_id>", stable across re-exports, so a
-re-delivered conversation updates rather than duplicates.
+Chunk ids are "<conversation key>:<node key>", stable across re-exports, so a
+re-delivered conversation updates rather than duplicates. Both parts are
+percent-encoded (every character but unreserved ones), so neither contains
+":" or "#": the "#<n>" given to the n-th copy of a conversation repeated in
+one export can never collide with a real conversation id, and the ":"
+between the parts is unambiguous. ChatGPT's ids are UUIDs, which encoding
+leaves unchanged.
 
 Traversal is iterative and order is deterministic (roots and siblings in
 export order), so the same bundle always yields the same chunks, as #13
@@ -36,6 +42,7 @@ from __future__ import annotations
 
 import json
 from typing import Any, Iterator
+from urllib.parse import quote
 
 from ..contracts.adapter import SealedBundle, SteleChunk, make_chunk
 
@@ -70,11 +77,12 @@ class ChatGPTExportAdapter:
                 raise MalformedExportError(f"{entry['path']} is not JSON: {exc}") from exc
             if not isinstance(conversation, dict):
                 raise MalformedExportError(f"{entry['path']} is not a JSON object")
-            conv_id = str(
+            conv_id = quote(str(
                 conversation.get("conversation_id") or conversation.get("id")
                 or f"conversation-{entry['index']:06d}"
-            )
+            ), safe="")
             # The same conversation twice in one export keeps both copies apart.
+            # An encoded id never contains "#", so the suffix cannot collide.
             seen_ids[conv_id] = seen_ids.get(conv_id, 0) + 1
             if seen_ids[conv_id] > 1:
                 conv_id = f"{conv_id}#{seen_ids[conv_id]}"
@@ -158,9 +166,15 @@ def _conversation_chunks(
 
         emitted_as = chunk_parent
         if text:
-            author = message.get("author") or {}
+            author = message.get("author")
+            if author is None:
+                author = {}
+            elif not isinstance(author, dict):
+                raise MalformedExportError(
+                    f"{conv_id}: node {node_id!r} has an author that is not an object"
+                )
             yield make_chunk(
-                f"{conv_id}:{node_id}",
+                f"{conv_id}:{quote(node_id, safe='')}",
                 text,
                 **base,
                 node_id=node_id,

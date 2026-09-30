@@ -234,7 +234,9 @@ class TestTampering:
         )
         report = verify_ledger(ledger)
         assert report.chain.ok and not report.ok
+        # Both halves of the edit are reported: the state and the cleared reason.
         assert report.problems == (
+            f"record {ids['withdrawn']}: error is None, the chain says 'INVALIDATED: superseded'",
             f"record {ids['withdrawn']}: state is 'sealed', the chain says 'invalidated'",
         )
 
@@ -289,7 +291,9 @@ class TestTampering:
         conn.execute("UPDATE replays SET outcome='reproduced' WHERE replay_id=?", (ids["replay"],))
         problems = verify_ledger(ledger).problems
         assert any("its events differ from the chain" in p for p in problems)
-        assert f"replay {ids['replay']} differs from the chain" in problems
+        assert (
+            f"replay {ids['replay']}: outcome is 'reproduced', the chain says 'unreplayable'"
+        ) in problems
 
     def test_truncation_is_caught_by_an_anchor(self, ledger, tmp_path) -> None:
         _lifecycle(ledger, tmp_path)
@@ -379,3 +383,168 @@ def test_cli_reports_head_and_problems(ledger, tmp_path) -> None:
     code, report = _cli(ledger, "--anchor", f"{seq}:{digest}")
     assert code == 1 and not report["ok"]
     assert any("the chain says 'invalidated'" in p for p in report["problems"])
+
+
+# ---------------------------------------------------------------------------
+# Every chained field is checked
+# ---------------------------------------------------------------------------
+
+def _with_input(ledger: LedgerStore, tmp_path: Path):
+    """A SEALED record over an archived input Snapshot and Source, run by bubblewrap."""
+    from stele.archive import Source
+    from stele.archive.records import Snapshot, SnapshotKind
+
+    doc = b"%PDF-1.7 the input"
+    digest = ledger.archive.put_bytes(doc)
+    snapshot = ledger.archive.put_snapshot(Snapshot(SnapshotKind.FILE, digest, len(doc), 1))
+    out = tmp_path / f"out-{uuid.uuid4().hex[:6]}"
+    out.mkdir()
+    (out / "doc.txt").write_text("hello")
+    record = ledger.create_pending(
+        **PROVENANCE, run_id=str(uuid.uuid4()), artifact_dir=out,
+        artifact_paths=[out / "doc.txt"], input_snapshot=snapshot,
+        source=Source(locator="/corpus/report.pdf"), backend="bubblewrap",
+    )
+    return ledger.seal(record.record_id)
+
+
+class TestEveryChainedField:
+
+    @pytest.mark.parametrize(("column", "value", "problem"), [
+        ("source_kind", "tree", "source_kind is 'tree', the chain says 'file'"),
+        ("source_id", "f" * 64, "source_id is 'ffff"),
+        ("backend", "wasmtime", "backend is 'wasmtime', the chain says 'bubblewrap'"),
+        ("created_at", "2001-01-01T00:00:00+00:00", "created_at is '2001-01-01T00:00:00+00:00'"),
+        ("source_path", "/elsewhere/report.pdf",
+         "source_path is '/elsewhere/report.pdf', its Source says '/corpus/report.pdf'"),
+    ])
+    def test_record_field_edited(self, ledger, tmp_path, column, value, problem) -> None:
+        record = _with_input(ledger, tmp_path)
+        assert verify_ledger(ledger).ok
+        _raw(ledger).execute(
+            f"UPDATE artifact_records SET {column}=? WHERE record_id=?", (value, record.record_id)
+        )
+        report = verify_ledger(ledger)
+        assert report.chain.ok and not report.ok
+        assert any(problem in p for p in report.problems), report.problems
+
+    def test_invalidation_reason_edited(self, ledger, tmp_path) -> None:
+        ids = _lifecycle(ledger, tmp_path)
+        _raw(ledger).execute(
+            "UPDATE artifact_records SET error='INVALIDATED: routine cleanup' WHERE record_id=?",
+            (ids["withdrawn"],),
+        )
+        assert verify_ledger(ledger).problems == (
+            f"record {ids['withdrawn']}: error is 'INVALIDATED: routine cleanup', "
+            "the chain says 'INVALIDATED: superseded'",
+        )
+
+    def test_failure_reason_edited(self, ledger, tmp_path) -> None:
+        ids = _lifecycle(ledger, tmp_path)
+        _raw(ledger).execute(
+            "UPDATE artifact_records SET error='out of disk' WHERE record_id=?", (ids["failed"],)
+        )
+        assert verify_ledger(ledger).problems == (
+            f"record {ids['failed']}: error is 'out of disk', the chain says 'parser crashed'",
+        )
+
+    @pytest.mark.parametrize(("column", "value"), [
+        ("reason", "looked fine"),
+        ("platform", "plan9-mips"),
+        ("policy", '{"name":"lenient"}'),
+    ])
+    def test_replay_field_edited(self, ledger, tmp_path, column, value) -> None:
+        ids = _lifecycle(ledger, tmp_path)
+        _raw(ledger).execute(f"UPDATE replays SET {column}=? WHERE replay_id=?", (value, ids["replay"]))
+        report = verify_ledger(ledger)
+        assert any(p.startswith(f"replay {ids['replay']}: {column} is") for p in report.problems)
+
+    def test_an_intact_lifecycle_still_verifies(self, ledger, tmp_path) -> None:
+        _lifecycle(ledger, tmp_path)
+        _with_input(ledger, tmp_path)
+        assert verify_ledger(ledger).ok
+
+
+# ---------------------------------------------------------------------------
+# Verifiers never migrate what they verify
+# ---------------------------------------------------------------------------
+
+def _pre_event_log(db: Path, tmp_path: Path) -> str:
+    """A version-6 ledger (no event log) whose invalidated record was then un-invalidated."""
+    ledger = open_ledger(db)
+    record = ledger.seal(_pending(ledger, tmp_path).record_id)
+    ledger.invalidate(record.record_id, "withdrawn")
+    ledger.close()
+    conn = sqlite3.connect(db)
+    conn.execute("DROP TABLE events")
+    conn.execute("ALTER TABLE delivery_events DROP COLUMN attempt_id")
+    conn.execute("PRAGMA user_version = 6")
+    conn.execute("UPDATE artifact_records SET state='sealed', error=NULL")
+    conn.commit()
+    conn.close()
+    return record.record_id
+
+
+def _version(db: Path) -> int:
+    conn = sqlite3.connect(db)
+    try:
+        return conn.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        conn.close()
+
+
+class TestVerifiersDoNotMigrate:
+
+    def test_an_older_ledger_is_refused_and_left_alone(self, tmp_path) -> None:
+        from stele.archive import BlobStore
+        from stele.ledger.store import LedgerSchemaError
+
+        db = tmp_path / "ledger.db"
+        _pre_event_log(db, tmp_path)
+        with pytest.raises(LedgerSchemaError, match="predates the event log"):
+            LedgerStore(db, BlobStore(tmp_path / "archive"), migrate=False)
+        assert _version(db) == 6
+
+    def test_a_missing_ledger_is_not_created(self, tmp_path) -> None:
+        from stele.archive import BlobStore
+        from stele.ledger.store import LedgerSchemaError
+
+        with pytest.raises(LedgerSchemaError, match="no ledger"):
+            LedgerStore(tmp_path / "none" / "ledger.db", BlobStore(tmp_path / "archive"),
+                        migrate=False)
+        assert not (tmp_path / "none").exists()
+
+    def test_a_current_ledger_opens(self, ledger, tmp_path) -> None:
+        from stele.archive import BlobStore
+
+        _lifecycle(ledger, tmp_path)
+        again = LedgerStore(ledger.db_path, BlobStore(tmp_path / "archive"), migrate=False)
+        assert verify_ledger(again).ok
+
+    def test_the_cli_refuses_instead_of_certifying(self, tmp_path) -> None:
+        db = tmp_path / "ledger.db"
+        _pre_event_log(db, tmp_path)
+        out = subprocess.run(
+            [sys.executable, "-m", "stele.ledger.events", str(db), str(tmp_path / "archive")],
+            capture_output=True, text=True,
+        )
+        assert out.returncode == 1
+        report = json.loads(out.stdout)
+        assert report["ok"] is False and "predates the event log" in report["problems"][0]
+        assert _version(db) == 6  # untouched: nothing was imported into a new chain
+
+    @pytest.mark.parametrize("argv", [
+        lambda db, archive, rid: ["-m", "stele.identity", "refs", db, archive, rid],
+        lambda db, archive, rid: ["-m", "stele.extraction", "extract", db, archive, rid],
+        lambda db, archive, rid: ["-m", "stele.verification", "list",
+                                  "--ledger", db, "--archive", archive],
+    ], ids=["identity", "extraction", "verification"])
+    def test_other_verifiers_refuse_too(self, tmp_path, argv) -> None:
+        db = tmp_path / "ledger.db"
+        record_id = _pre_event_log(db, tmp_path)
+        out = subprocess.run(
+            [sys.executable, *argv(str(db), str(tmp_path / "archive"), record_id)],
+            capture_output=True, text=True,
+        )
+        assert out.returncode == 1 and "cannot open the ledger" in out.stderr
+        assert _version(db) == 6

@@ -15,7 +15,7 @@ from pathlib import Path
 from ..archive import BlobStore
 from ..contracts.adapter import SealedBundle
 from ..ledger.models import ArtifactState
-from ..ledger.store import LedgerStore
+from ..ledger.store import LedgerSchemaError, LedgerStore
 from .contract import Extraction, ExtractionFormatError
 from .normalizers import normalize
 from .resolver import ResolutionError, Resolver
@@ -37,7 +37,12 @@ def main(argv: list[str] | None = None) -> int:
     ve.add_argument("--allow-invalidated", action="store_true")
     args = ap.parse_args(argv)
 
-    ledger = LedgerStore(args.ledger, BlobStore(args.archive))
+    try:
+        # Read-only: a verifier never migrates the ledger it reads.
+        ledger = LedgerStore(args.ledger, BlobStore(args.archive), migrate=False)
+    except LedgerSchemaError as exc:
+        print(f"cannot open the ledger: {exc}", file=sys.stderr)
+        return 1
     try:
         if args.command == "extract":
             record = ledger.get(args.record_id)

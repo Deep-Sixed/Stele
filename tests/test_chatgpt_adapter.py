@@ -222,6 +222,42 @@ def test_duplicate_conversation_ids_stay_apart(tmp_path) -> None:
     assert "conv-branched#2:a1r" in ids
 
 
+def test_a_renamed_duplicate_never_collides_with_a_real_id(tmp_path) -> None:
+    # Two copies of "conv-branched" plus a real conversation already called
+    # "conv-branched#2": the copy's suffix must not land on the real id.
+    real = json.loads(json.dumps(BRANCHED))
+    real["conversation_id"] = "conv-branched#2"
+    chunks = ChatGPTExportAdapter().transform(
+        _bundle(tmp_path, _export(BRANCHED, real, BRANCHED))
+    )
+    ids = [c.chunk_id for c in chunks]
+    assert len(ids) == len(set(ids)) == 15
+    conversations = {c.metadata["conversation_id"] for c in chunks}
+    assert conversations == {"conv-branched", "conv-branched%232", "conv-branched#2"}
+
+
+def test_colons_in_ids_cannot_make_two_chunks_one(tmp_path) -> None:
+    # Without encoding, conversation "a:b" node "c" and conversation "a" node
+    # "b:c" would both be the chunk "a:b:c".
+    first = {"conversation_id": "a:b", "mapping": {
+        "c": _node("c", None, [], _msg("c", "user", ["one"])),
+    }}
+    second = {"conversation_id": "a", "mapping": {
+        "b:c": _node("b:c", None, [], _msg("b:c", "user", ["two"])),
+    }}
+    chunks = ChatGPTExportAdapter().transform(_bundle(tmp_path, _export(first, second)))
+    assert sorted(c.chunk_id for c in chunks) == ["a%3Ab:c", "a:b%3Ac"]
+    # The node id in metadata stays raw: extraction anchors point into mapping by it.
+    assert {c.metadata["node_id"] for c in chunks} == {"c", "b:c"}
+
+
+def test_uuid_ids_are_unchanged_by_encoding(tmp_path) -> None:
+    conversation = json.loads(json.dumps(BRANCHED))
+    conversation["conversation_id"] = "6710a4c5-1b2e-8003-a4b9-2f6c1a7d9e10"
+    chunks = ChatGPTExportAdapter().transform(_bundle(tmp_path, _export(conversation)))
+    assert "6710a4c5-1b2e-8003-a4b9-2f6c1a7d9e10:a1r" in {c.chunk_id for c in chunks}
+
+
 def test_deep_conversation_does_not_recurse(tmp_path) -> None:
     depth = 5000
     mapping = {
@@ -244,6 +280,8 @@ def test_deep_conversation_does_not_recurse(tmp_path) -> None:
     (lambda c: c.update(mapping=[]), "mapping is not an object"),
     (lambda c: c["mapping"]["q1"].update(children="a1"), "children that are not a list"),
     (lambda c: c.update(current_node=["a1r"]), "current_node"),
+    (lambda c: c["mapping"]["a1"]["message"].update(author="assistant"),
+     "author that is not an object"),
 ])
 def test_malformed_conversations_fail(tmp_path, mutate, message) -> None:
     conversation = json.loads(json.dumps(BRANCHED))

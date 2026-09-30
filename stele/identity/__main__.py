@@ -17,7 +17,7 @@ from typing import Any
 from ..archive import BlobStore, Snapshot, Source
 from ..ledger.events import EventLog
 from ..ledger.models import ArtifactRecord
-from ..ledger.store import LedgerStore, RecordNotFoundError
+from ..ledger.store import LedgerSchemaError, LedgerStore, RecordNotFoundError
 from .refs import Observation, event_ref, observation_of, record_ref
 from .resolver import IdentityResolver, ResolveError
 
@@ -53,7 +53,12 @@ def main(argv: list[str] | None = None) -> int:
     rf.add_argument("record_id")
     args = ap.parse_args(argv)
 
-    ledger = LedgerStore(args.ledger, BlobStore(args.archive))
+    try:
+        # Read-only: a verifier never migrates the ledger it reads.
+        ledger = LedgerStore(args.ledger, BlobStore(args.archive), migrate=False)
+    except LedgerSchemaError as exc:
+        print(f"cannot open the ledger: {exc}", file=sys.stderr)
+        return 1
     try:
         if args.command == "refs":
             try:

@@ -387,14 +387,59 @@ class LedgerStore:
     (callers serialize writes externally or rely on SQLite's own locking).
     """
 
-    def __init__(self, db_path: Path, archive: BlobStore) -> None:
+    def __init__(self, db_path: Path, archive: BlobStore, *, migrate: bool = True) -> None:
+        """Open (or create) the ledger at db_path.
+
+        With migrate=False, as verifiers open it, the ledger must already
+        exist at the current schema: nothing is created or migrated, and
+        LedgerSchemaError says why a ledger cannot be opened. A verifier
+        must never rewrite what it verifies; migrating a ledger older than
+        the event log would chain its current tables as *.imported events
+        and then vouch for them.
+        """
         if not isinstance(archive, BlobStore):
             raise TypeError("LedgerStore needs the BlobStore its records point into")
         self.archive = archive
         self.db_path = Path(db_path)
+        if not migrate:
+            if not self.db_path.is_file():
+                raise LedgerSchemaError(f"no ledger at {self.db_path}")
+            self._conn = connect(self.db_path)
+            try:
+                self._check_schema()
+            except BaseException:
+                self._conn.close()
+                raise
+            return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = connect(self.db_path)
         self._open_schema()
+
+    def _check_schema(self) -> None:
+        version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        has_table = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifact_records'"
+        ).fetchone() is not None
+        if not has_table:
+            raise LedgerSchemaError(f"{self.db_path} is not a Stele ledger")
+        if version > SCHEMA_VERSION:
+            raise LedgerSchemaError(
+                f"ledger schema version {version} is newer than this Stele ({SCHEMA_VERSION})"
+            )
+        if version < SCHEMA_VERSION:
+            has_events = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone() is not None
+            detail = (
+                "" if has_events else
+                "; it predates the event log, so there is no chain to verify its "
+                "tables against"
+            )
+            raise LedgerSchemaError(
+                f"ledger schema version {version} is older than this Stele ({SCHEMA_VERSION})"
+                f"{detail}. Verification never migrates a ledger; open it with "
+                "LedgerStore (e.g. by recording a run) to migrate it first"
+            )
 
     def _open_schema(self) -> None:
         from .migration import migrate_to_current

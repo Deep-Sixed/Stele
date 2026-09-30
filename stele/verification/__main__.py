@@ -18,15 +18,20 @@ import sys
 from pathlib import Path
 
 from ..archive import BlobStore
-from ..ledger.store import LedgerStore
+from ..ledger.store import LedgerSchemaError, LedgerStore
 from .campaign import Campaign, Journal, Observation
 from .corpus import Corpus
 from .report import Gates, VerificationReport, Waiver, build_report
 from .signoff import SignOffRefused, check_sign_off, sign_off, sign_offs
 
 
-def _ledger(args: argparse.Namespace) -> LedgerStore:
-    return LedgerStore(args.ledger, BlobStore(args.archive))
+def _ledger(args: argparse.Namespace, *, migrate: bool = False) -> LedgerStore:
+    """The ledger; only `run`, which records runs, may migrate it.
+
+    report, sign-off, check and list verify the ledger, and a verifier never
+    migrates what it verifies (LedgerSchemaError says why it cannot open it).
+    """
+    return LedgerStore(args.ledger, BlobStore(args.archive), migrate=migrate)
 
 
 def _store_args(p: argparse.ArgumentParser) -> None:
@@ -72,7 +77,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         config = {**defaults, **config}
     else:
         lanes = lane_mod.extractor_lanes(args.extractor, backends)
-    ledger = _ledger(args)
+    ledger = _ledger(args, migrate=True)
     try:
         campaign = Campaign(
             ledger, Corpus.load(args.corpus), args.root, lanes, baseline=args.baseline,
@@ -220,7 +225,11 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(func=_cmd_list)
 
     args = ap.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except LedgerSchemaError as exc:
+        print(f"cannot open the ledger: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

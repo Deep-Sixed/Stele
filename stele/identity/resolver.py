@@ -117,6 +117,7 @@ class IdentityResolver:
             observation = observation_of(record)
         except ValueError as exc:
             raise ResolveError(f"{ref}: {exc}") from exc
+        self._check_observed_facts(ref, record)
         if observation.digest != ref.digest:
             raise ResolveError(
                 f"{ref}: the record's observation has digest {observation.digest}, not {ref.digest}"
@@ -125,6 +126,41 @@ class IdentityResolver:
         if observation.source_id is not None:
             self._resolve_SourceRef(SourceRef(observation.source_id))
         return observation
+
+    def _check_observed_facts(self, ref: ObservationRef, record: ArtifactRecord) -> None:
+        """The record's row must say what its creation event in the chain says.
+
+        An observation is rebuilt from the row, so it must not resolve from a
+        row edited after the fact. source_hash, source_kind and source_id are
+        chained with every record; created_at is chained for records created
+        since the event log first committed to it (older records' creation
+        time rests on the row alone).
+        """
+        log = EventLog(self.ledger)
+        try:
+            created = next(
+                (e for e in log.for_subject(record.record_id)
+                 if e.kind in ("record.created", "record.imported")),
+                None,
+            )
+        finally:
+            log.close()
+        if created is None:
+            raise ResolveError(f"{ref}: record {record.record_id} has no creation event in the chain")
+        body = created.body
+        facts = {
+            "source_hash": record.source_hash,
+            "source_kind": record.source_kind.value if record.source_kind else None,
+            "source_id": record.source_id,
+        }
+        if "created_at" in body:
+            facts["created_at"] = record.created_at.isoformat()
+        for key, value in facts.items():
+            if body.get(key) != value:
+                raise ResolveError(
+                    f"{ref}: the record's {key} is {value!r}, but its creation event "
+                    f"(event {created.seq}) says {body.get(key)!r}"
+                )
 
     def _resolve_AnchorRef(self, ref: AnchorRef) -> str:
         record = self._resolve_RecordRef(ref.record)

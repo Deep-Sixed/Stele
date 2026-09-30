@@ -178,15 +178,21 @@ Delivery is never a ledger state.
 conversation, each holding the exact bytes of its element of
 `conversations.json`.
 
-- **Streamed.** `iter_chunks()` reads and verifies one conversation at a time,
-  so memory is bounded by the largest conversation, not the export.
-  `transform()` is `list(iter_chunks())`.
+- **Streamed.** `iter_chunks()` reads, verifies and parses one conversation
+  at a time, so it holds one parsed conversation at once. `transform()`, which
+  the Dispatcher calls, is `list(iter_chunks())`: it returns every chunk, so
+  it holds the text of the whole export.
 - **Every branch.** A conversation is a tree. Editing a message or
   regenerating a response keeps the old version as a sibling, and
   `current_node` only marks the leaf the UI shows. The adapter walks the whole
   `mapping` iteratively, so any depth works. Every node whose message has
-  content becomes one chunk, `<conversation_id>:<node_id>`, stable across
-  re-exports.
+  content becomes one chunk, `<conversation key>:<node key>`, stable across
+  re-exports. Both parts are percent-encoded, so neither contains `:` or
+  `#`. The `#<n>` given to the n-th copy of a conversation repeated in one
+  export can't collide with a real conversation id, and two different
+  (conversation, node) pairs never share a chunk id. ChatGPT's UUID ids are
+  unchanged by the encoding. A message whose `author` isn't an object is
+  malformed.
 - **Rebuildable.** Chunk metadata rebuilds each branch:
   - `parent_node_id`, the nearest ancestor that has a chunk, so empty system
     nodes don't break the chain;

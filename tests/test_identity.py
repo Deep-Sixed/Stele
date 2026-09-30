@@ -221,6 +221,23 @@ class TestResolve:
             problems = IdentityResolver(ledger).check(other.ref)
             assert problems and "observation has digest" in problems[0]
 
+    @pytest.mark.parametrize("column", ["created_at", "source_id"])
+    def test_an_observation_rebuilt_from_an_edited_row_is_refused(self, tmp_path, column) -> None:
+        # Edit the row, then present the observation rebuilt from it. Its
+        # digest matches the row, so only the record's creation event in the
+        # chain can show that the row is not what was recorded.
+        ledger, record = _sealed(tmp_path)
+        other_source = ledger.archive.put_source(Source(locator="/somewhere/else.pdf"))
+        value = {"created_at": "2001-01-01T00:00:00+00:00", "source_id": other_source}[column]
+        conn = sqlite3.connect(ledger.db_path, isolation_level=None)
+        conn.execute(f"UPDATE artifact_records SET {column}=? WHERE record_id=?",
+                     (value, record.record_id))
+        conn.close()
+        forged = observation_of(ledger.get(record.record_id))
+        problems = IdentityResolver(ledger).check(forged.ref)
+        assert problems and f"the record's {column} is" in problems[0]
+        assert "creation event" in problems[0]
+
     def test_record_without_input_has_no_observation(self, tmp_path) -> None:
         ledger = open_ledger(tmp_path / "ledger.db")
         out = tmp_path / "out"

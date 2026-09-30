@@ -169,11 +169,11 @@ the two can't diverge:
 
 | Event | When |
 |---|---|
-| `record.created` | `create_pending`: run, artifact hash, input Snapshot, Source, parser identity and config, backend |
+| `record.created` | `create_pending`: run, artifact hash, input Snapshot, Source, parser identity and config, run conditions, backend, creation time |
 | `record.sealed` / `record.failed` / `record.invalidated` | each state transition, with its error or reason |
 | `delivery.opened` / `delivery.event` | each delivery and each intent, receipt, failure or removal in the delivery log |
 | `replay.logged` | each replay and its outcome |
-| `*.imported` | the state found when a ledger was migrated to version 5 |
+| `*.imported` | the state found when a ledger was migrated to the event log (version 7) |
 
 **The chain.**
 - Each event's hash is SHA-256 over the canonical JSON of its sequence number,
@@ -188,9 +188,16 @@ the two can't diverge:
 1. It verifies the chain: every hash, every link, no gaps in the sequence.
 2. It replays the chain to rebuild what the ledger's tables must contain
    (each record's state and identity, each delivery and its events, each
-   replay) and reports every difference. This catches edits to
+   replay) and reports every difference. Every field an event commits to is
+   compared, including a record's input Snapshot kind, Source, backend,
+   creation time and its failure or invalidation reason, and a replay's
+   reason, policy and platform. A record's `source_path` is checked against
+   the archived Source its `source_id` names. This catches edits to
    `artifact_records`, the one table whose rows legitimately change, such as
-   an `invalidated` record flipped back to `sealed` by hand.
+   an `invalidated` record flipped back to `sealed` by hand. `artifact_dir`
+   is only where the run's output was on disk, not evidence, and isn't
+   checked. Records created before the chain carried `created_at` have their
+   creation time on the row alone.
 
 A tampered event body is reported, never a crash.
 
@@ -205,6 +212,17 @@ python -m stele.ledger.events ledger.db archive/ [--anchor SEQ:HASH]
 
 This prints `ok`, the chain length, the head and every problem, and exits 1
 if there is any problem.
+
+**Verifiers never migrate.** This command and the other read-only tools
+(`python -m stele.identity`, `python -m stele.extraction`, and the `report`,
+`sign-off`, `check` and `list` commands of `python -m stele.verification`)
+open the ledger with `LedgerStore(..., migrate=False)`. A ledger older than
+this Stele is refused with `LedgerSchemaError` and left exactly as it was,
+instead of being migrated. Migrating a ledger that predates the event log
+would chain its current tables as `*.imported` events, and the verifier would
+then report tables it had just vouched for as verified. Open such a ledger
+the normal way (for example by recording a run) to migrate it first; there
+is no chain to verify what it held before then.
 
 ## Implementation
 
