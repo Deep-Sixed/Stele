@@ -379,9 +379,13 @@ class OciBackend(SandboxBackend):
         if self.gpu:
             argv += list(info.gpu_flags)
 
-        # Ephemeral scratch space, mirroring the bubblewrap layout.
+        # Ephemeral scratch space, mirroring the bubblewrap layout. Without
+        # writable_scratch the same (empty) mounts are read-only, so
+        # /stele/output is the only writable path, as bubblewrap's Landlock
+        # rules make it there.
+        access = "rw" if config.writable_scratch else "ro"
         for path in ["/tmp", *_EPHEMERAL_TMPFS]:
-            argv += ["--tmpfs", f"{path}:rw,nosuid,nodev,size={self.tmpfs_size},mode=1777"]
+            argv += ["--tmpfs", f"{path}:{access},nosuid,nodev,size={self.tmpfs_size},mode=1777"]
 
         # Writable artifact output: the ONLY path that survives the container.
         config.artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -527,7 +531,7 @@ class OciBackend(SandboxBackend):
                 f"killed by SIGKILL at the {self.memory} container memory limit",
                 exit_code=exit_code, signal=9,
             )
-        if exit_code in _ENGINE_ERRORS:
+        if exit_code in _ENGINE_ERRORS and _engine_failed(exit_code, stderr):
             last = _last_line(stderr)
             return RunFailure(
                 FailureReason.ENGINE_ERROR,
@@ -546,6 +550,28 @@ _ENGINE_ERRORS = {
     127: "the parser command was not found in the image",
 }
 _SIGKILL_EXIT = 128 + 9
+
+# The same statuses are ordinary exit codes for the parser itself, so they are
+# an engine error only when the engine or OCI runtime says so on stderr. A
+# failed exec of the parser command (126/127) is always reported by the
+# runtime ("OCI runtime ... executable file not found", "unable to start
+# container process"); for 125 the engines' own "Error: ..." (podman) or
+# "docker: ..." prefix is enough, since the engine exits 125 for many
+# different messages. A parser can still imitate these lines, but then it
+# only misreports its own failure.
+_RUNTIME_ERROR_RE = re.compile(
+    r"OCI runtime|OCI permission denied|unable to start container process"
+    r"|Error response from daemon|executable file not found in \$PATH"
+)
+_ENGINE_PREFIX_RE = re.compile(r"^(?:Error: |docker: )")
+
+
+def _engine_failed(exit_code: int, stderr: str) -> bool:
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    last = lines[-1] if lines else ""
+    if _RUNTIME_ERROR_RE.search(last):
+        return True
+    return exit_code == 125 and bool(_ENGINE_PREFIX_RE.match(last))
 
 
 def _last_line(text: str) -> str:

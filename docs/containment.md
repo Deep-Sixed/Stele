@@ -119,8 +119,19 @@ as the entrypoint of the image, so it must resolve inside the image (e.g.
   timed-out result: the parser may still be running with its output
   directory mounted writable, so nothing in that directory is collected or
   sealed (`exc.artifact_dir` names it).
+- **Statuses 125–127.** The engines use them for their own failures, and a
+  parser may exit with them too. A status counts as an `engine_error` only
+  when stderr ends with the engine's or OCI runtime's message (a failed exec
+  of the command, an unknown image or runtime, an `Error response from
+  daemon`, or podman's/docker's `Error: `/`docker: ` prefix at 125);
+  otherwise it is the parser's own `exit_status`. A parser that prints the
+  engine's exact wording and exits 125 is still taken for an engine error.
+- **Scratch.** The `/tmp` and other tmpfs mounts are writable by default
+  (`writable_scratch=True`). With `writable_scratch=False` they are mounted
+  read-only (still empty) on top of the read-only root filesystem, so
+  `/stele/output` is the only writable path.
 - **Known limits.** Mount paths containing commas or quotes are refused rather
-  than escaped. An engine error and a parser exiting 125 are indistinguishable.
+  than escaped.
   SELinux-enforcing hosts may need volume relabeling, which is not done yet.
   If the Stele process is killed, a running Docker container is not stopped
   (Podman gets `--timeout` as a backstop).
