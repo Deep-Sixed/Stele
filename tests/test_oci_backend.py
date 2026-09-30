@@ -466,6 +466,9 @@ class TestExitClassification:
     @pytest.mark.parametrize("code, stderr", [
         (127, RUNC_NOT_FOUND),
         (127, DOCKER_NOT_FOUND),
+        (127, DOCKER_NOT_FOUND + "\n\nRun 'docker run --help' for more information"),
+        (125, "docker: Error response from daemon: pull access denied.\n\n"
+              "Run 'docker run --help' for more information"),
         (126, 'Error: runc: ... exec: "/etc/passwd": permission denied: OCI permission denied'),
         (125, "Error: nosuchimage:1: image not known"),
         (125, 'Error: default OCI runtime "nosuch" not found: invalid argument'),
@@ -480,6 +483,7 @@ class TestExitClassification:
         (126, "Error: parser says no"),
         (127, "Traceback ...\nSystemExit: 127"),
         (125, "the parser gave up"),
+        (126, "Error: noise\n" + "x\n" * 5),        # an engine-looking line, long before the end
         (126, ""),
     ])
     def test_the_parsers_own_exit_status(self, code: int, stderr: str) -> None:

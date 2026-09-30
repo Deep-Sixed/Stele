@@ -552,7 +552,7 @@ _ENGINE_ERRORS = {
 _SIGKILL_EXIT = 128 + 9
 
 # The same statuses are ordinary exit codes for the parser itself, so they are
-# an engine error only when the engine or OCI runtime says so on stderr. A
+# an engine error only when the engine or OCI runtime says so at the end of stderr. A
 # failed exec of the parser command (126/127) is always reported by the
 # runtime ("OCI runtime ... executable file not found", "unable to start
 # container process"); for 125 the engines' own "Error: ..." (podman) or
@@ -564,14 +564,17 @@ _RUNTIME_ERROR_RE = re.compile(
     r"|Error response from daemon|executable file not found in \$PATH"
 )
 _ENGINE_PREFIX_RE = re.compile(r"^(?:Error: |docker: )")
+_ENGINE_TAIL_LINES = 3
 
 
 def _engine_failed(exit_code: int, stderr: str) -> bool:
+    # Docker follows its error with "Run 'docker run --help' for more
+    # information", so look at the last few lines, not only the last.
     lines = [line.strip() for line in stderr.splitlines() if line.strip()]
-    last = lines[-1] if lines else ""
-    if _RUNTIME_ERROR_RE.search(last):
+    tail = lines[-_ENGINE_TAIL_LINES:]
+    if any(_RUNTIME_ERROR_RE.search(line) for line in tail):
         return True
-    return exit_code == 125 and bool(_ENGINE_PREFIX_RE.match(last))
+    return exit_code == 125 and any(_ENGINE_PREFIX_RE.match(line) for line in tail)
 
 
 def _last_line(text: str) -> str:
