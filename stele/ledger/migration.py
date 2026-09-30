@@ -23,7 +23,10 @@ LedgerStore opens, so it either completes or leaves the database untouched:
   archive and verified against the recorded manifest (from disk, or from the
   archive if it already holds the bundle). A committed record whose bundle
   cannot be verified becomes INVALIDATED with the reason: the ledger can no
-  longer vouch for that content.
+  longer vouch for that content. The reason says whether the evidence was
+  missing (neither on disk nor archived) or mismatched; only a record with
+  missing evidence can be restored later, by ledger.reverify, from files that
+  still hash as recorded.
 - source_hash is kept only when it is the digest of exactly one Snapshot in
   the archive. Otherwise it moves to legacy_source_hash, which is unverified
   audit data and never used as provenance.
@@ -53,6 +56,11 @@ from .store import (
     archive_bundle,
     create_schema,
 )
+
+
+# Why a committed record was invalidated by migration (prefix of its error).
+EVIDENCE_MISSING = "evidence missing"
+EVIDENCE_MISMATCHED = "evidence mismatched"
 
 
 class LedgerMigrationError(Exception):
@@ -162,9 +170,13 @@ def _migrate_row(old: dict, archive: BlobStore) -> dict:
         ) as exc:
             row["state"] = "invalidated"
             row["finalized_at"] = datetime.now(timezone.utc).isoformat()
+            # Missing evidence (neither on disk nor archived) can be restored
+            # by an operator who still has the files (ledger.reverify);
+            # anything else means the content is not what was recorded.
+            kind = EVIDENCE_MISSING if isinstance(exc, MissingArtifactError) else EVIDENCE_MISMATCHED
             row["error"] = (
-                "INVALIDATED: migration — committed bundle could not be archived "
-                f"and verified: {exc!r}"
+                f"INVALIDATED: migration — {kind}: committed bundle could not be "
+                f"archived and verified: {exc!r}"
             )
         else:
             row["state"] = "sealed"
